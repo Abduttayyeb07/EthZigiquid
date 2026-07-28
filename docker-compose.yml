@@ -1,0 +1,73 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: zig_automation
+      POSTGRES_USER: zig
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U zig -d zig_automation"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    environment:
+      NODE_ENV: production
+      PORT: 4000
+      HOST: 0.0.0.0
+      TRUST_PROXY: ${TRUST_PROXY:-false}
+      WEB_ORIGIN: ${DOCKER_WEB_ORIGIN:-http://localhost:18300}
+      CONTROL_API_TOKEN: ${CONTROL_API_TOKEN:?Set CONTROL_API_TOKEN in .env}
+      STATE_ENCRYPTION_KEY: ${STATE_ENCRYPTION_KEY:?Set STATE_ENCRYPTION_KEY in .env}
+      PERSIST_RUNTIME_STATE: "true"
+      EXECUTION_MODE: ${EXECUTION_MODE:-live}
+      DATABASE_URL: postgresql://zig:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/zig_automation
+      ZIG_TOKEN_ADDRESS: ${ZIG_TOKEN_ADDRESS:-0xb2617246d0c6c0087f18703d576831899ca94f01}
+      UNISWAP_V2_ROUTER_ADDRESS: ${UNISWAP_V2_ROUTER_ADDRESS:-0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D}
+      WETH_ADDRESS: ${WETH_ADDRESS:-0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2}
+      ALCHEMY_RPC_URL: ${ALCHEMY_RPC_URL:-}
+      RPC_HTTP_URLS: ${RPC_HTTP_URLS:-https://eth.llamarpc.com,https://ethereum.publicnode.com,https://rpc.ankr.com/eth,https://cloudflare-eth.com,https://eth-mainnet.public.blastapi.io,https://1rpc.io/eth,https://rpc.flashbots.net,https://endpoints.omniatech.io/v1/eth/mainnet/public}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    ports:
+      - "${DOCKER_BIND_ADDRESS:-127.0.0.1}:${API_HOST_PORT:-18400}:4000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:4000/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    read_only: true
+    tmpfs:
+      - /tmp
+    restart: unless-stopped
+
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile.web
+      args:
+        NEXT_PUBLIC_API_URL: ${DOCKER_PUBLIC_API_URL:-http://localhost:18400}
+    environment:
+      PORT: 3000
+      HOSTNAME: 0.0.0.0
+    ports:
+      - "${DOCKER_BIND_ADDRESS:-127.0.0.1}:${WEB_HOST_PORT:-18300}:3000"
+    depends_on:
+      api:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp
+    restart: unless-stopped
+
+volumes:
+  postgres_data:

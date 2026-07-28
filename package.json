@@ -1,0 +1,35 @@
+{
+  "name": "zig-volume-automation",
+  "version": "0.1.0",
+  "private": true,
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "predev": "npm run build -w @zig/shared",
+    "dev": "concurrently -n api,web -c cyan,magenta \"npm run dev -w @zig/api\" \"npm run dev -w @zig/web\"",
+    "build": "npm run build -w @zig/shared && npm run build -w @zig/api && npm run build -w @zig/web",
+    "test": "npm run build -w @zig/shared && npm run test -w @zig/api",
+    "lint": "npm run lint -w @zig/api && npm run lint -w @zig/web",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "format": "prettier --write .",
+    "db:migrate": "npm run db:migrate -w @zig/api"
+  },
+  "devDependencies": {
+    "concurrently": "9.2.0",
+    "prettier": "3.6.2",
+    "typescript": "5.8.3",
+    "typescript-eslint": "^8.65.0"
+  },
+  "overrides": {
+    "eslint": "10.8.0",
+    "brace-expansion": "5.0.8",
+    "minimatch": "10.2.5",
+    "postcss": "8.5.23",
+    "sharp": "0.35.3"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  }
+}
