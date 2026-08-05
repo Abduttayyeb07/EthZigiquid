@@ -72,6 +72,8 @@ export async function buildApp(overrides?: {
   await app.register(sensible);
   await app.register(helmet, { contentSecurityPolicy: false });
   await app.register(cors, {
+    methods: ["GET", "HEAD", "POST", "PATCH", "OPTIONS"],
+    allowedHeaders: ["authorization", "content-type"],
     origin: (origin, callback) => {
       if (!origin || allowedBrowserOrigin(origin)) {
         callback(null, true);
