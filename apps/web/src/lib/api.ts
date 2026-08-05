@@ -43,11 +43,12 @@ export function setControlToken(token: string) {
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   let response: Response;
+  const hasBody = init?.body !== undefined && init.body !== null;
   try {
     response = await fetch(`${getApiUrl()}${path}`, {
       ...init,
       headers: {
-        "Content-Type": "application/json",
+        ...(hasBody ? { "Content-Type": "application/json" } : {}),
         ...(typeof window !== "undefined" && sessionStorage.getItem(TOKEN_KEY)
           ? { Authorization: `Bearer ${sessionStorage.getItem(TOKEN_KEY)}` }
           : {}),
