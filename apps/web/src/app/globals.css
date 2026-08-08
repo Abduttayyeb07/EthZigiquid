@@ -788,6 +788,52 @@ button:disabled { opacity: .5; cursor: not-allowed; }
   color: #69d9b5;
   background: rgba(62,154,128,.045);
 }
+.activity-side { min-width: 0; display: grid; gap: 18px; align-content: start; }
+.tx-panel { min-height: 0; }
+.tx-list { padding: 7px 0 11px; display: grid; }
+.tx-row {
+  min-height: 62px;
+  display: grid;
+  grid-template-columns: 46px minmax(0, 1fr) auto;
+  gap: 11px;
+  align-items: center;
+  padding: 10px 20px;
+  color: inherit;
+  text-decoration: none;
+  border-left: 2px solid transparent;
+}
+.tx-row:hover { background: #111319; border-left-color: var(--accent); }
+.tx-row:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.tx-side {
+  justify-self: start;
+  padding: 3px 7px;
+  border-radius: 6px;
+  font-size: 9.5px;
+  font-weight: 600;
+  letter-spacing: .06em;
+}
+.tx-side.buy { color: var(--green); background: rgba(53, 208, 139, .1); }
+.tx-side.sell { color: var(--blue); background: rgba(80, 165, 255, .1); }
+.tx-body { min-width: 0; display: grid; gap: 4px; }
+.tx-body strong {
+  font-size: 12px;
+  font-weight: 500;
+  color: #c0c8d2;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.tx-body small { font-size: 10.5px; color: #737b88; }
+.tx-hash {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: #7f8d96;
+}
+.tx-row:hover .tx-hash { color: var(--accent-2); }
+
 .rpc-footer div { min-width: 0; display: grid; gap: 5px; }
 .rpc-footer strong { color: #cdd5dc; font-size: 12px; }
 .rpc-footer span { color: #7f8d96; font-size: 11px; line-height: 1.45; overflow-wrap: anywhere; }
@@ -948,7 +994,12 @@ input, button { max-width: 100%; }
   .cycle-controls__field small { min-height: 0; }
   .cycle-controls__actions, .cycle-controls__actions .save-button { width: 100%; }
   .activity-grid > #network { width: 100%; }
-  .logs-panel, .rpc-panel { width: 100%; min-height: 0; }
+  .activity-side { width: 100%; }
+  .logs-panel, .rpc-panel, .tx-panel { width: 100%; min-height: 0; }
+  /* The pair summary is the useful part on a narrow screen; the truncated hash
+     is not, and the whole row is still the link. */
+  .tx-row { grid-template-columns: 46px minmax(0, 1fr); }
+  .tx-hash { display: none; }
   .log-stream { height: min(358px, 55vh); }
   .rpc-list { max-height: none; }
 }

@@ -2,14 +2,16 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery } from "@tanstack/react-query";
-import { Activity, Bot, Clock3, Fuel, Pause, Play, Radio, RefreshCcw, ShieldCheck, Terminal, Wallet, Zap } from "lucide-react";
+import { Activity, ArrowUpRight, Bot, Clock3, Fuel, Pause, Play, Radio, Receipt, RefreshCcw, ShieldCheck, Terminal, Wallet, Zap } from "lucide-react";
 import { toast } from "sonner";
-import type { AutomationSettings, BotSnapshot, LogLevel, WalletBalances } from "@zig/shared";
+import type { AutomationSettings, BotSnapshot, LogLevel, TransactionRecord, WalletBalances } from "@zig/shared";
 import { api, clearControlToken, hasControlToken, setControlToken, type BuySimulation } from "@/lib/api";
 import { useBotStore } from "@/store/bot";
 
 // Keeps the router quote fresh without tying it to the state poll interval.
 const QUOTE_REFRESH_MS = 30_000;
+// The API pins every provider to chain id 1, so the explorer is always mainnet.
+const ETHERSCAN_TX_URL = "https://etherscan.io/tx/";
 
 export function Dashboard() {
   const { snapshot, connected, setSnapshot, setConnected } = useBotStore();
@@ -452,7 +454,10 @@ export function Dashboard() {
 
           <div className="bottom-grid activity-grid" id="activity">
             <LiveLogs snapshot={snapshot} />
-            <div id="network"><RpcPanel snapshot={snapshot} /></div>
+            <div className="activity-side">
+              <TransactionsPanel snapshot={snapshot} />
+              <div id="network"><RpcPanel snapshot={snapshot} /></div>
+            </div>
           </div>
         </section>
       </div>
@@ -605,6 +610,50 @@ function LiveLogs({ snapshot }: { snapshot: BotSnapshot }) {
   );
 }
 
+function TransactionsPanel({ snapshot }: { snapshot: BotSnapshot }) {
+  const transactions = snapshot.recentTransactions;
+  return (
+    <section className="panel tx-panel">
+      <div className="panel-head">
+        <div><Receipt size={17} /><span>Transactions</span></div>
+        <span className="healthy-count">Latest {transactions.length || 5}</span>
+      </div>
+      <div className="tx-list">
+        {transactions.map((tx) => <TransactionRow tx={tx} key={tx.id} />)}
+        {!transactions.length && (
+          <div className="empty">Confirmed swaps appear here with an Etherscan link.</div>
+        )}
+      </div>
+    </section>
+  );
+}
+
+function TransactionRow({ tx }: { tx: TransactionRecord }) {
+  const isBuy = tx.side === "buy";
+  return (
+    <a
+      className="tx-row"
+      href={`${ETHERSCAN_TX_URL}${tx.hash}`}
+      target="_blank"
+      // noreferrer keeps the wallet-bearing dashboard URL out of the explorer's
+      // referer header; noopener stops the new tab reaching back into it.
+      rel="noopener noreferrer"
+      title={tx.hash}
+    >
+      <span className={`tx-side ${isBuy ? "buy" : "sell"}`}>{isBuy ? "BUY" : "SELL"}</span>
+      <div className="tx-body">
+        <strong>
+          {isBuy
+            ? `${trimAmount(tx.ethAmount)} ETH → ${trimAmount(tx.zigAmount)} ZIG`
+            : `${trimAmount(tx.zigAmount)} ZIG → ${trimAmount(tx.ethAmount)} ETH`}
+        </strong>
+        <small>Cycle #{tx.cycle} · {formatTime(tx.timestamp)} · {formatUsd(tx.gasUsd)} gas</small>
+      </div>
+      <span className="tx-hash">{shortHash(tx.hash)}<ArrowUpRight size={13} /></span>
+    </a>
+  );
+}
+
 function RpcPanel({ snapshot }: { snapshot: BotSnapshot }) {
   const healthyRpcs = snapshot.rpcHealth.filter((rpc) => rpc.healthy);
   const activeRpc = healthyRpcs.find((rpc) => rpc.active);
@@ -635,6 +684,15 @@ function DashboardSkeleton() {
 }
 
 function shortAddress(address: string) { return `${address.slice(0, 6)}...${address.slice(-4)}`; }
+function shortHash(hash: string) { return `${hash.slice(0, 8)}...${hash.slice(-6)}`; }
+/** Keeps swap sizes readable without hiding a value that rounds away to zero. */
+function trimAmount(value: string) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return value;
+  if (parsed === 0) return "0";
+  if (parsed < 0.0001) return parsed.toExponential(2);
+  return parsed.toLocaleString("en-US", { maximumFractionDigits: parsed < 1 ? 6 : 4 });
+}
 function formatTime(value: string) { return new Date(value).toLocaleTimeString([], { hour12: false }); }
 function formatRuntime(seconds: number) { const h = Math.floor(seconds / 3600); const m = Math.floor((seconds % 3600) / 60); return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}:${String(seconds % 60).padStart(2, "0")}`; }
 function formatUsd(value: number) { return new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", minimumFractionDigits: value < 1 ? 4 : 2, maximumFractionDigits: value < 1 ? 4 : 2 }).format(value); }

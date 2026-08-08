@@ -1,12 +1,14 @@
 import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto";
 import pg from "pg";
-import type { AutomationSettings, BotStatistics } from "@zig/shared";
+import type { AutomationSettings, BotStatistics, TransactionRecord } from "@zig/shared";
 
 export interface PersistedRuntimeState {
   settings: AutomationSettings;
   stats: BotStatistics;
   walletPrivateKey: string | null;
   pendingSellAmountRaw: string | null;
+  /** Absent in payloads written before recent transactions were tracked. */
+  recentTransactions?: TransactionRecord[];
   shouldResume: boolean;
 }
 

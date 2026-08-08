@@ -1,7 +1,9 @@
 import { EventEmitter } from "node:events";
+import { formatUnits } from "ethers";
 import { nanoid } from "nanoid";
 import {
   DEFAULT_SETTINGS,
+  RECENT_TRANSACTION_LIMIT,
   type AutomationSettings,
   type BotSnapshot,
   type BotStatistics,
@@ -9,9 +11,10 @@ import {
   type LogEntry,
   type LogLevel,
   type RpcHealth,
+  type TransactionRecord,
 } from "@zig/shared";
 import { AppError, normalizeError } from "../lib/errors.js";
-import type { LiveTrader } from "./live-trader.js";
+import type { ExecutedSwap, LiveTrader } from "./live-trader.js";
 import type { RuntimeStateStore } from "../state/runtime-state-store.js";
 
 export interface GasReader {
@@ -29,6 +32,7 @@ export class AutomationEngine {
   private settings: AutomationSettings = { ...DEFAULT_SETTINGS };
   private walletPrivateKey: string | null = null;
   private readonly logs: LogEntry[] = [];
+  private recentTransactions: TransactionRecord[] = [];
   private readonly events = new EventEmitter();
   private timer: NodeJS.Timeout | null = null;
   private cycleInFlight = false;
@@ -72,6 +76,7 @@ export class AutomationEngine {
     this.stats = restored.stats;
     this.walletPrivateKey = restored.walletPrivateKey;
     this.pendingSellAmountRaw = restored.pendingSellAmountRaw;
+    this.recentTransactions = restored.recentTransactions ?? [];
     if (restored.shouldResume && this.walletPrivateKey && this.settings.walletAddress) {
       this.status = "running";
       this.statusMessage = this.pendingSellAmountRaw ? "Resuming persisted sell leg" : "Resuming automation";
@@ -87,6 +92,7 @@ export class AutomationEngine {
       settings: { ...this.settings },
       statistics: { ...this.stats, runtimeSeconds: this.runtimeSeconds() },
       logs: [...this.logs],
+      recentTransactions: [...this.recentTransactions],
       rpcHealth: this.rpc.snapshot(),
       executionMode: this.executionMode,
       signerConfigured: Boolean(this.walletPrivateKey),
@@ -148,6 +154,9 @@ export class AutomationEngine {
     this.settings = { ...this.settings, walletAddress: null };
     this.stats.ethBalance = "0.0000";
     this.stats.zigBalance = "0.00";
+    // A transaction hash resolves to the wallet address on any explorer, so the
+    // history is purged alongside the credentials it would otherwise expose.
+    this.recentTransactions = [];
     this.addLog("warning", `${reason}; wallet credentials were purged`);
     await this.purgePersistedCredentials();
     this.emit();
@@ -171,6 +180,7 @@ export class AutomationEngine {
     this.stats.ethBalance = "0.0000";
     this.stats.zigBalance = "0.00";
     this.stats.nextExecutionAt = null;
+    this.recentTransactions = [];
     this.addLog("warning", reason);
     await this.purgePersistedCredentials();
     this.emit();
@@ -438,6 +448,9 @@ export class AutomationEngine {
       // This is set immediately after confirmation. Every subsequent retry is
       // forced through the sell branch until this exact amount is sold.
       this.pendingSellAmountRaw = buy.receivedRaw;
+      // Recorded only after the sell lock is set. Display bookkeeping must never
+      // run ahead of the guarantee that a confirmed buy will be sold.
+      this.recordTransaction(buy);
       await this.persist();
       this.addLog("success", "Buy confirmed; sell leg locked", {
         hash: buy.hash,
@@ -467,7 +480,10 @@ export class AutomationEngine {
       shouldContinue: () => this.shouldContinueExecution(),
     });
     this.recordSwapMetrics(sell.gasUsd);
+    // Cleared first for the same reason: a recording failure must not leave the
+    // lock set and cause the same ZIG to be sold twice.
     this.pendingSellAmountRaw = null;
+    this.recordTransaction(sell);
     await this.persist();
     this.addLog("success", "Sell confirmed", {
       hash: sell.hash,
@@ -504,6 +520,7 @@ export class AutomationEngine {
       stats: this.stats,
       walletPrivateKey: this.walletPrivateKey,
       pendingSellAmountRaw: this.pendingSellAmountRaw,
+      recentTransactions: this.recentTransactions,
       shouldResume,
     });
   }
@@ -567,8 +584,43 @@ export class AutomationEngine {
     this.stats.averageGasUsd = round(this.stats.totalGasUsd / this.stats.totalTransactions);
     this.stats.lastTradeAt = new Date().toISOString();
   }
+
+  /**
+   * Keeps the newest confirmed swaps so the dashboard can link each one to a
+   * block explorer. Only confirmed hashes reach this list; a reverted or
+   * never-broadcast swap throws before it is called.
+   */
+  private recordTransaction(swap: ExecutedSwap): void {
+    const isBuy = swap.side === "buy";
+    this.recentTransactions.unshift({
+      id: nanoid(),
+      hash: swap.hash,
+      side: swap.side,
+      cycle: this.stats.currentCycle,
+      ethAmount: formatRaw(isBuy ? swap.soldRaw : swap.receivedRaw),
+      zigAmount: formatRaw(isBuy ? swap.receivedRaw : swap.soldRaw),
+      gasUsd: round(swap.gasUsd),
+      timestamp: new Date().toISOString(),
+    });
+    if (this.recentTransactions.length > RECENT_TRANSACTION_LIMIT) {
+      this.recentTransactions.length = RECENT_TRANSACTION_LIMIT;
+    }
+  }
 }
 
 function round(value: number): number {
   return Math.round(value * 100) / 100;
+}
+
+/**
+ * Formats a base-unit amount for display without ever throwing. This runs after
+ * a swap has already settled on chain, so a malformed field must degrade to a
+ * readable row rather than abort the cycle that owns the position.
+ */
+function formatRaw(value: string | undefined): string {
+  try {
+    return formatUnits(BigInt(value ?? "0"), 18);
+  } catch {
+    return "0";
+  }
 }

@@ -283,4 +283,98 @@ describe("AutomationEngine", () => {
     await expect(engine.start()).rejects.toMatchObject({ code: "WALLET_DISCONNECTED" });
     engine.dispose();
   });
+
+  it("records confirmed swaps newest first with explorer-ready hashes", async () => {
+    vi.useFakeTimers();
+    const executeSwap = vi.fn()
+      .mockResolvedValueOnce({
+        side: "buy",
+        hash: "0xbuy",
+        soldRaw: "1000000000000000",
+        receivedRaw: "4778167863778748062",
+        gasUsd: 0.12,
+      })
+      .mockResolvedValueOnce({
+        side: "sell",
+        hash: "0xsell",
+        soldRaw: "4778167863778748062",
+        receivedRaw: "994000000000000",
+        gasUsd: 0.14,
+      });
+    const engine = createLiveEngine(executeSwap);
+    await engine.configureWallet({ walletAddress: address, privateKey: "1".repeat(64) });
+    await engine.start();
+
+    await vi.advanceTimersByTimeAsync(0);
+    expect(engine.snapshot().recentTransactions).toMatchObject([
+      { side: "buy", hash: "0xbuy", ethAmount: "0.001", zigAmount: "4.778167863778748062" },
+    ]);
+
+    await vi.advanceTimersByTimeAsync(30_000);
+    const [sell, buy] = engine.snapshot().recentTransactions;
+    expect(sell).toMatchObject({
+      side: "sell",
+      hash: "0xsell",
+      zigAmount: "4.778167863778748062",
+      ethAmount: "0.000994",
+      gasUsd: 0.14,
+    });
+    expect(buy).toMatchObject({ side: "buy", hash: "0xbuy" });
+
+    await engine.stop();
+    // A hash resolves to the wallet on any explorer, so it must not outlive the
+    // credentials that the stop path purges.
+    expect(engine.snapshot().recentTransactions).toEqual([]);
+    engine.dispose();
+    vi.useRealTimers();
+  });
+
+  it("keeps only the five newest transactions", async () => {
+    vi.useFakeTimers();
+    const executeSwap = vi.fn().mockImplementation(({ side }: { side: "buy" | "sell" }) =>
+      Promise.resolve({
+        side,
+        hash: `0x${side}${executeSwap.mock.calls.length}`,
+        soldRaw: "1000000000000000",
+        receivedRaw: "1000000000000000",
+        gasUsd: 0.1,
+      }),
+    );
+    const engine = createLiveEngine(executeSwap);
+    await engine.configureWallet({ walletAddress: address, privateKey: "1".repeat(64) });
+    await engine.start();
+
+    await vi.advanceTimersByTimeAsync(0);
+    for (let leg = 0; leg < 6; leg += 1) await vi.advanceTimersByTimeAsync(30_000);
+    expect(executeSwap.mock.calls.length).toBe(7);
+
+    const recent = engine.snapshot().recentTransactions;
+    expect(recent).toHaveLength(5);
+    expect(recent.map((tx) => tx.hash)).toEqual(["0xbuy7", "0xsell6", "0xbuy5", "0xsell4", "0xbuy3"]);
+    engine.dispose();
+    vi.useRealTimers();
+  });
+
+  it("records a confirmed swap even when the trader omits an amount field", async () => {
+    vi.useFakeTimers();
+    // The buy leg must still lock its sell and keep running; display formatting
+    // is never allowed to abort a cycle that already holds a position.
+    const executeSwap = vi.fn()
+      .mockResolvedValueOnce({ side: "buy", hash: "0xbuy", receivedRaw: "500", gasUsd: 0.1 })
+      .mockResolvedValueOnce({ side: "sell", hash: "0xsell", soldRaw: "500", receivedRaw: "900", gasUsd: 0.1 });
+    const engine = createLiveEngine(executeSwap);
+    await engine.configureWallet({ walletAddress: address, privateKey: "1".repeat(64) });
+    await engine.start();
+
+    await vi.advanceTimersByTimeAsync(0);
+    expect(engine.snapshot().recentTransactions).toMatchObject([
+      { side: "buy", hash: "0xbuy", ethAmount: "0.0" },
+    ]);
+
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(executeSwap.mock.calls.map(([input]) => input.side)).toEqual(["buy", "sell"]);
+    expect(engine.snapshot().status).not.toBe("error");
+    engine.dispose();
+    vi.useRealTimers();
+  });
 });

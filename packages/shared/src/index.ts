@@ -48,6 +48,22 @@ export interface LogEntry {
   context?: Record<string, unknown>;
 }
 
+/** Number of confirmed swaps the dashboard keeps available for inspection. */
+export const RECENT_TRANSACTION_LIMIT = 5;
+
+export interface TransactionRecord {
+  id: string;
+  hash: string;
+  side: TradeSide;
+  cycle: number;
+  /** Decimal ETH moved by the swap: spent on a buy, received on a sell. */
+  ethAmount: string;
+  /** Decimal ZIG moved by the swap: received on a buy, sold on a sell. */
+  zigAmount: string;
+  gasUsd: number;
+  timestamp: string;
+}
+
 export interface RpcHealth {
   url: string;
   healthy: boolean;
@@ -64,6 +80,7 @@ export interface BotSnapshot {
   settings: AutomationSettings;
   statistics: BotStatistics;
   logs: LogEntry[];
+  recentTransactions: TransactionRecord[];
   rpcHealth: RpcHealth[];
   executionMode: "paper" | "live";
   signerConfigured: boolean;
