@@ -39,14 +39,16 @@ Default development URLs:
 - Frontend: `http://localhost:3000`
 - API: `http://localhost:4000`
 
-Enter the value of `CONTROL_API_TOKEN` on the operator access screen.
+Enter one value from `CONTROL_API_TOKEN` on the operator access screen. Each
+browser creates its own operator session, so separate PCs can use the same token
+without sharing wallet, settings, logs, timer, or encrypted recovery state.
 
 ## Required configuration
 
 Set these values in `.env` before live use:
 
 ```env
-CONTROL_API_TOKEN=choose-a-strong-private-token
+CONTROL_API_TOKEN=operator-one-token,operator-two-token
 STATE_ENCRYPTION_KEY=64-hex-characters
 POSTGRES_PASSWORD=choose-a-url-safe-password
 EXECUTION_MODE=live
@@ -94,4 +96,3 @@ npm run build
 npm audit --omit=dev
 docker compose config
 ```
-

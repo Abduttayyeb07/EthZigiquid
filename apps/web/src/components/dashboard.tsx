@@ -1,12 +1,15 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { Activity, Bot, Clock3, Fuel, Pause, Play, Radio, RefreshCcw, ShieldCheck, Terminal, Wallet, Zap } from "lucide-react";
 import { toast } from "sonner";
 import type { AutomationSettings, BotSnapshot, LogLevel, WalletBalances } from "@zig/shared";
-import { api, hasControlToken, setControlToken, type BuySimulation } from "@/lib/api";
+import { api, clearControlToken, hasControlToken, setControlToken, type BuySimulation } from "@/lib/api";
 import { useBotStore } from "@/store/bot";
+
+// Keeps the router quote fresh without tying it to the state poll interval.
+const QUOTE_REFRESH_MS = 30_000;
 
 export function Dashboard() {
   const { snapshot, connected, setSnapshot, setConnected } = useBotStore();
@@ -18,6 +21,11 @@ export function Dashboard() {
   const [balances, setBalances] = useState<WalletBalances | null>(null);
   const [simulation, setSimulation] = useState<BuySimulation | null>(null);
   const [authenticated, setAuthenticated] = useState(false);
+  const [walletEditedLocally, setWalletEditedLocally] = useState(false);
+  const [amountEditedLocally, setAmountEditedLocally] = useState(false);
+  const amountEditedLocallyRef = useRef(false);
+  const pendingSavedAmountRef = useRef<string | null>(null);
+  const latestSimulationKeyRef = useRef<string | null>(null);
 
   useEffect(() => setAuthenticated(hasControlToken()), []);
   const stateQuery = useQuery({
@@ -26,15 +34,28 @@ export function Dashboard() {
     enabled: authenticated,
     refetchInterval: 2_000,
   });
+  // This runs on every poll response. Fields the operator is currently editing
+  // must be left alone, otherwise the poll overwrites input mid-keystroke.
   useEffect(() => {
     if (!stateQuery.data) return;
     setSnapshot(stateQuery.data);
+    const serverAmount = stateQuery.data.settings.tradeAmountEth;
+    const pendingSavedAmount = pendingSavedAmountRef.current;
+    if (pendingSavedAmount && serverAmount === pendingSavedAmount) {
+      pendingSavedAmountRef.current = null;
+      amountEditedLocallyRef.current = false;
+      setAmountEditedLocally(false);
+    }
+    const protectAmount =
+      amountEditedLocallyRef.current ||
+      amountEditedLocally ||
+      Boolean(pendingSavedAmountRef.current);
     setForm((current) => ({
       ...current,
-      walletAddress: stateQuery.data.settings.walletAddress ?? current.walletAddress,
-      tradeAmountEth: stateQuery.data.settings.tradeAmountEth,
+      walletAddress: walletEditedLocally ? current.walletAddress : stateQuery.data.settings.walletAddress ?? current.walletAddress,
+      tradeAmountEth: protectAmount ? current.tradeAmountEth : serverAmount,
     }));
-  }, [stateQuery.data, setSnapshot]);
+  }, [stateQuery.data, setSnapshot, walletEditedLocally, amountEditedLocally]);
 
   useEffect(() => setConnected(stateQuery.isSuccess), [setConnected, stateQuery.isSuccess]);
 
@@ -46,8 +67,6 @@ export function Dashboard() {
 
   const simulateBuy = useMutation({
     mutationFn: (input: { amountEth: string; slippageBps?: number }) => api.simulateBuy(input),
-    onSuccess: (data) => setSimulation(data),
-    onError: () => setSimulation(null),
   });
 
   const startAutomation = useMutation({
@@ -60,6 +79,7 @@ export function Dashboard() {
         snapshot.settings.walletAddress?.toLowerCase() === walletAddress.toLowerCase();
       if (!walletAddress) throw new Error("Wallet address is required.");
       if (!signerMatches && !privateKey) throw new Error("Private key is required for this wallet.");
+      if (!isPositiveEthAmount(tradeAmountEth)) throw new Error("Trade amount must be greater than zero.");
       if (!signerMatches) await api.connectWallet({ walletAddress, privateKey });
       await api.settings({ tradeAmountEth });
       return api.start();
@@ -73,6 +93,11 @@ export function Dashboard() {
         updatedAt: new Date().toISOString(),
       });
       setForm((current) => ({ ...current, privateKey: "" }));
+      setWalletEditedLocally(false);
+      // Start persists the amount before running, so the form is in sync again.
+      pendingSavedAmountRef.current = null;
+      amountEditedLocallyRef.current = false;
+      setAmountEditedLocally(false);
       toast.success("Automation started");
     },
     onError: (error) => toast.error(error.message),
@@ -93,11 +118,41 @@ export function Dashboard() {
     onError: (error) => toast.error(error.message),
   });
 
-  const saveControls = useMutation({
-    mutationFn: (settings: Partial<AutomationSettings>) => api.settings(settings),
+  const clearWallet = useMutation({
+    mutationFn: () => api.clearWallet(),
     onSuccess: (data) => {
       setSnapshot(data);
-      setForm((current) => ({ ...current, tradeAmountEth: data.settings.tradeAmountEth }));
+      setBalances(null);
+      setWalletEditedLocally(false);
+      setForm((current) => ({
+        ...current,
+        walletAddress: "",
+        privateKey: "",
+      }));
+      toast.success("Wallet credentials cleared");
+    },
+    onError: (error) => toast.error(error.message),
+  });
+
+  const saveControls = useMutation({
+    mutationFn: (settings: Partial<AutomationSettings>) => api.settings(settings),
+    onSuccess: (data, variables) => {
+      setSnapshot(data);
+      // Only resync the amount when this save actually carried it. The cycle
+      // controls share this mutation and must not revert an in-progress edit.
+      if (variables.tradeAmountEth !== undefined) {
+        const savedAmount = variables.tradeAmountEth;
+        setForm((current) => ({ ...current, tradeAmountEth: savedAmount }));
+        if (data.settings.tradeAmountEth === savedAmount) {
+          pendingSavedAmountRef.current = null;
+          amountEditedLocallyRef.current = false;
+          setAmountEditedLocally(false);
+        } else {
+          pendingSavedAmountRef.current = savedAmount;
+          amountEditedLocallyRef.current = true;
+          setAmountEditedLocally(true);
+        }
+      }
       toast.success("Controls saved");
     },
     onError: (error) => toast.error(error.message),
@@ -109,21 +164,37 @@ export function Dashboard() {
     return () => clearTimeout(timer);
   }, [form.walletAddress]);
 
+  // Depends on the slippage value rather than the whole snapshot. Depending on
+  // the snapshot re-ran this on every 2s poll, firing a router quote per tick.
+  const slippageBps = snapshot?.settings.slippageBps ?? null;
   useEffect(() => {
-    if (!snapshot) return;
     const amount = form.tradeAmountEth.trim();
-    if (!/^\d+(\.\d{1,18})?$/.test(amount) || Number(amount) <= 0) {
+    if (slippageBps === null || !isPositiveEthAmount(amount)) {
+      latestSimulationKeyRef.current = null;
       setSimulation(null);
       return;
     }
-    const timer = setTimeout(() => {
-      simulateBuy.mutate({
-        amountEth: amount,
-        slippageBps: Number.isFinite(Number(snapshot.settings.slippageBps)) ? snapshot.settings.slippageBps : 100,
-      });
-    }, 350);
-    return () => clearTimeout(timer);
-  }, [form.tradeAmountEth, snapshot]);
+    const effectiveSlippage = Number.isFinite(slippageBps) ? slippageBps : 100;
+    const quoteKey = `${amount}:${effectiveSlippage}`;
+    latestSimulationKeyRef.current = quoteKey;
+    const quote = () => simulateBuy.mutate(
+      { amountEth: amount, slippageBps: effectiveSlippage },
+      {
+        onSuccess: (data) => {
+          if (latestSimulationKeyRef.current === quoteKey) setSimulation(data);
+        },
+        onError: () => {
+          if (latestSimulationKeyRef.current === quoteKey) setSimulation(null);
+        },
+      },
+    );
+    const debounce = setTimeout(quote, 350);
+    const refresh = setInterval(quote, QUOTE_REFRESH_MS);
+    return () => {
+      clearTimeout(debounce);
+      clearInterval(refresh);
+    };
+  }, [form.tradeAmountEth, slippageBps]);
 
   if (!authenticated) return <AccessGate onAuthenticated={() => setAuthenticated(true)} />;
   if (!snapshot) return <DashboardSkeleton />;
@@ -136,7 +207,7 @@ export function Dashboard() {
     !stopAutomation.isPending &&
     Boolean(form.walletAddress.trim()) &&
     (Boolean(form.privateKey.trim()) || signerMatches) &&
-    Number(form.tradeAmountEth) > 0;
+    isPositiveEthAmount(form.tradeAmountEth.trim());
   const displayedEth = balances?.eth ?? snapshot.statistics.ethBalance;
   const displayedZig = balances?.zig ?? snapshot.statistics.zigBalance;
   const walletValue = simulation
@@ -212,7 +283,10 @@ export function Dashboard() {
                 <div className="wallet-access__grid">
                   <label className="wallet-access__field wallet-access__field--wide">
                     <span>Wallet address</span>
-                    <input value={form.walletAddress} onChange={(event) => setForm((current) => ({ ...current, walletAddress: event.target.value }))} placeholder="0x..." />
+                    <input value={form.walletAddress} onChange={(event) => {
+                      setWalletEditedLocally(true);
+                      setForm((current) => ({ ...current, walletAddress: event.target.value }));
+                    }} placeholder="0x..." />
                   </label>
                   <label className="wallet-access__field wallet-access__field--wide">
                     <span>Private key</span>
@@ -225,7 +299,14 @@ export function Dashboard() {
                     </div>
                     <div className="wallet-access__amount-input-wrap">
                       <div className="wallet-access__amount-input">
-                        <input value={form.tradeAmountEth} onChange={(event) => setForm((current) => ({ ...current, tradeAmountEth: event.target.value }))} inputMode="decimal" />
+                        <input value={form.tradeAmountEth} onFocus={() => {
+                          amountEditedLocallyRef.current = true;
+                          setAmountEditedLocally(true);
+                        }} onChange={(event) => {
+                          amountEditedLocallyRef.current = true;
+                          setAmountEditedLocally(true);
+                          setForm((current) => ({ ...current, tradeAmountEth: event.target.value }));
+                        }} inputMode="decimal" />
                         <strong>ETH</strong>
                       </div>
                       <small className="wallet-access__usd">
@@ -289,7 +370,21 @@ export function Dashboard() {
                   <button className="secondary-button" disabled={refreshBalances.isPending || !form.walletAddress.trim()} onClick={() => refreshBalances.mutate(form.walletAddress.trim())}>
                     <RefreshCcw size={16} /> {refreshBalances.isPending ? "Refreshing..." : "Refresh balances"}
                   </button>
-                  <button className="primary-button" disabled={saveControls.isPending} onClick={() => saveControls.mutate({ tradeAmountEth: form.tradeAmountEth.trim() || snapshot.settings.tradeAmountEth })}>
+                  <button className="secondary-button" disabled={active || clearWallet.isPending || (!snapshot.signerConfigured && !snapshot.settings.walletAddress && !form.walletAddress.trim())} onClick={() => clearWallet.mutate()}>
+                    {clearWallet.isPending ? "Clearing..." : "Clear wallet"}
+                  </button>
+                  <button className="primary-button" disabled={saveControls.isPending} onClick={() => {
+                    const tradeAmountEth = form.tradeAmountEth.trim() || snapshot.settings.tradeAmountEth;
+                    if (!isPositiveEthAmount(tradeAmountEth)) {
+                      toast.error("Trade amount must be greater than zero.");
+                      return;
+                    }
+                    pendingSavedAmountRef.current = tradeAmountEth;
+                    amountEditedLocallyRef.current = true;
+                    setAmountEditedLocally(true);
+                    setForm((current) => ({ ...current, tradeAmountEth }));
+                    saveControls.mutate({ tradeAmountEth });
+                  }}>
                     {saveControls.isPending ? "Saving..." : "Save amount"}
                   </button>
                 </div>
@@ -386,7 +481,7 @@ function AccessGate({ onAuthenticated }: { onAuthenticated: () => void }) {
             await api.state();
             onAuthenticated();
           } catch {
-            sessionStorage.removeItem("zig-control-token");
+            clearControlToken();
             setError("Invalid control token or API unavailable.");
           } finally {
             setChecking(false);
@@ -544,3 +639,6 @@ function formatTime(value: string) { return new Date(value).toLocaleTimeString([
 function formatRuntime(seconds: number) { const h = Math.floor(seconds / 3600); const m = Math.floor((seconds % 3600) / 60); return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}:${String(seconds % 60).padStart(2, "0")}`; }
 function formatUsd(value: number) { return new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", minimumFractionDigits: value < 1 ? 4 : 2, maximumFractionDigits: value < 1 ? 4 : 2 }).format(value); }
 function successRate(snapshot: BotSnapshot) { const { successfulSwaps, failedSwaps } = snapshot.statistics; return successfulSwaps + failedSwaps === 0 ? "100.0" : ((successfulSwaps / (successfulSwaps + failedSwaps)) * 100).toFixed(1); }
+function isPositiveEthAmount(value: string) {
+  return /^\d+(\.\d{1,18})?$/.test(value) && value.replace(".", "").replace(/^0+/, "").length > 0;
+}

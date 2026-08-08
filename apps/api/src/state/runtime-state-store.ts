@@ -10,29 +10,39 @@ export interface PersistedRuntimeState {
   shouldResume: boolean;
 }
 
+/**
+ * Creates the runtime table once for the whole process. Every operator session
+ * shares one connection pool, so schema setup must not run per session.
+ */
+export async function initializeRuntimeStateSchema(pool: pg.Pool): Promise<void> {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS automation_runtime (
+      id TEXT PRIMARY KEY,
+      encrypted_payload TEXT NOT NULL,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    )
+  `);
+}
+
 export class RuntimeStateStore {
-  private readonly pool: pg.Pool;
   private readonly key: Buffer;
 
-  constructor(databaseUrl: string, encryptionKeyHex: string) {
-    this.pool = new pg.Pool({ connectionString: databaseUrl, max: 3 });
+  /**
+   * The pool is owned by the caller and shared across every operator session.
+   * One pool per session exhausts PostgreSQL connections as sessions grow.
+   */
+  constructor(
+    private readonly pool: pg.Pool,
+    encryptionKeyHex: string,
+    private readonly runtimeId = "primary",
+  ) {
     this.key = Buffer.from(encryptionKeyHex, "hex");
-  }
-
-  async initialize(): Promise<void> {
-    await this.pool.query(`
-      CREATE TABLE IF NOT EXISTS automation_runtime (
-        id TEXT PRIMARY KEY,
-        encrypted_payload TEXT NOT NULL,
-        updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-      )
-    `);
   }
 
   async load(): Promise<PersistedRuntimeState | null> {
     const result = await this.pool.query<{ encrypted_payload: string }>(
       "SELECT encrypted_payload FROM automation_runtime WHERE id = $1",
-      ["primary"],
+      [this.runtimeId],
     );
     const payload = result.rows[0]?.encrypted_payload;
     return payload ? this.decrypt(payload) : null;
@@ -44,16 +54,20 @@ export class RuntimeStateStore {
       `INSERT INTO automation_runtime (id, encrypted_payload, updated_at)
        VALUES ($1, $2, now())
        ON CONFLICT (id) DO UPDATE SET encrypted_payload = EXCLUDED.encrypted_payload, updated_at = now()`,
-      ["primary", payload],
+      [this.runtimeId, payload],
     );
   }
 
   async clear(): Promise<void> {
-    await this.pool.query("DELETE FROM automation_runtime WHERE id = $1", ["primary"]);
+    await this.pool.query("DELETE FROM automation_runtime WHERE id = $1", [this.runtimeId]);
   }
 
-  async close(): Promise<void> {
-    await this.pool.end();
+  async listIds(prefix: string): Promise<string[]> {
+    const result = await this.pool.query<{ id: string }>(
+      "SELECT id FROM automation_runtime WHERE id LIKE $1 ORDER BY updated_at DESC",
+      [`${prefix}%`],
+    );
+    return result.rows.map((row) => row.id);
   }
 
   private encrypt(state: PersistedRuntimeState): string {

@@ -112,13 +112,26 @@ export class AutomationEngine {
     // Complete preflight before changing state so a transient balance failure
     // cannot leave the engine marked as running without a scheduled cycle.
     await this.refreshBalances();
+    const previousStatus = this.status;
+    const previousStatusMessage = this.statusMessage;
+    const previousStats = { ...this.stats };
+    const previousFailures = this.consecutiveFailures;
     this.status = "running";
     this.statusMessage = this.executionMode === "live" ? "Automation running on Ethereum mainnet" : "Automation running in paper mode";
     this.stats.startedAt = new Date().toISOString();
     this.stats.nextExecutionAt = new Date().toISOString();
     this.consecutiveFailures = 0;
+    try {
+      await this.persist(true);
+    } catch (error) {
+      this.status = previousStatus;
+      this.statusMessage = previousStatusMessage;
+      this.stats = previousStats;
+      this.consecutiveFailures = previousFailures;
+      this.emit();
+      throw error;
+    }
     this.addLog("success", "Automation started");
-    await this.persist(true);
     this.emit();
     void this.runCycle();
     return this.snapshot();
@@ -141,6 +154,29 @@ export class AutomationEngine {
     return this.snapshot();
   }
 
+  async clearWallet(reason = "Wallet credentials cleared"): Promise<BotSnapshot> {
+    if (this.status !== "stopped" && this.status !== "error") {
+      throw new AppError("INVALID_REQUEST", "Stop automation before clearing wallet credentials.", 409);
+    }
+    if (this.cycleInFlight) {
+      throw new AppError(
+        "INVALID_REQUEST",
+        "The previous transaction is still settling. Wait before clearing wallet credentials.",
+        409,
+      );
+    }
+    this.walletPrivateKey = null;
+    this.pendingSellAmountRaw = null;
+    this.settings = { ...this.settings, walletAddress: null };
+    this.stats.ethBalance = "0.0000";
+    this.stats.zigBalance = "0.00";
+    this.stats.nextExecutionAt = null;
+    this.addLog("warning", reason);
+    await this.purgePersistedCredentials();
+    this.emit();
+    return this.snapshot();
+  }
+
   async shutdown(reason = "Service shutting down"): Promise<void> {
     this.resumeAfterShutdown = this.canSchedule() || this.cycleInFlight;
     this.shuttingDown = true;
@@ -157,7 +193,15 @@ export class AutomationEngine {
       throw new AppError("INVALID_REQUEST", "Wallet credentials must be changed through the wallet connection endpoint.", 400);
     }
     const previousInterval = this.settings.intervalSeconds;
+    const previousSettings = this.settings;
     this.settings = { ...this.settings, ...patch };
+    try {
+      await this.persist();
+    } catch (error) {
+      this.settings = previousSettings;
+      this.emit();
+      throw error;
+    }
     this.addLog("info", "Settings updated", { fields: Object.keys(patch) });
     if (patch.intervalSeconds && patch.intervalSeconds !== previousInterval && this.timer) {
       clearTimeout(this.timer);
@@ -165,7 +209,6 @@ export class AutomationEngine {
       this.addLog("success", `Interval changed to ${patch.intervalSeconds}s while running`);
     }
     this.emit();
-    await this.persist();
     return this.snapshot();
   }
 
@@ -193,13 +236,24 @@ export class AutomationEngine {
       );
     }
     const walletAddress = await this.trader.verifyCredentials(input.walletAddress, input.privateKey);
-    this.settings = { ...this.settings, walletAddress };
-    this.walletPrivateKey = input.privateKey;
-    await this.refreshBalances();
+    const previousSettings = this.settings;
+    const previousPrivateKey = this.walletPrivateKey;
+    const previousStats = { ...this.stats };
+    try {
+      this.settings = { ...this.settings, walletAddress };
+      this.walletPrivateKey = input.privateKey;
+      await this.refreshBalances();
+      await this.persist();
+    } catch (error) {
+      this.settings = previousSettings;
+      this.walletPrivateKey = previousPrivateKey;
+      this.stats = previousStats;
+      this.emit();
+      throw error;
+    }
     this.addLog("success", "Server-side wallet credentials configured", {
       walletAddress,
     });
-    await this.persist();
     this.emit();
     return this.snapshot();
   }
@@ -218,6 +272,19 @@ export class AutomationEngine {
     this.emit();
   }
 
+  /**
+   * True only when dropping this engine from memory cannot abandon funds.
+   * A cycle in flight, a locked sell leg, or any non-terminal status means the
+   * engine is still responsible for an unfinished position and must be kept.
+   */
+  isEvictable(): boolean {
+    return (
+      !this.cycleInFlight &&
+      !this.pendingSellAmountRaw &&
+      (this.status === "stopped" || this.status === "error")
+    );
+  }
+
   dispose(): void {
     if (this.timer) clearTimeout(this.timer);
     this.events.removeAllListeners();
@@ -226,10 +293,16 @@ export class AutomationEngine {
   private async runCycle(): Promise<void> {
     if (this.status === "stopped" || this.cycleInFlight) return;
     this.cycleInFlight = true;
-    if (this.executionMode === "paper" || !this.pendingSellAmountRaw) {
+    const isSellLeg = Boolean(this.pendingSellAmountRaw);
+    if (!isSellLeg) {
       this.stats.currentCycle += 1;
     }
-    this.setStatus("processing", `Preparing cycle #${this.stats.currentCycle}`);
+    this.setStatus(
+      "processing",
+      isSellLeg
+        ? `Preparing sell leg for cycle #${this.stats.currentCycle}`
+        : `Preparing buy leg for cycle #${this.stats.currentCycle}`,
+    );
     let retryDelayMs: number | undefined;
 
     try {
@@ -246,18 +319,22 @@ export class AutomationEngine {
       }
 
       this.addLog("success", `Gas acceptable ($${estimate.feeUsd.toFixed(2)})`);
+      let completedCycle = false;
       if (this.executionMode === "paper") {
-        await this.paperSwap("buy", estimate.feeUsd);
-        await this.paperSwap("sell", estimate.feeUsd);
+        completedCycle = await this.paperLeg(estimate.feeUsd);
       } else {
-        await this.liveCycle();
+        completedCycle = await this.liveLeg();
       }
       if (!this.shouldContinueExecution()) return;
-      this.stats.totalCycles += 1;
-      this.stats.lastTradeAt = new Date().toISOString();
       this.consecutiveFailures = 0;
-      this.setStatus("running", `Cycle #${this.stats.currentCycle} completed successfully`);
-      this.addLog("success", `Cycle #${this.stats.currentCycle} completed successfully`);
+      if (completedCycle) {
+        this.stats.totalCycles += 1;
+        this.stats.lastTradeAt = new Date().toISOString();
+        this.setStatus("running", `Cycle #${this.stats.currentCycle} completed successfully`);
+        this.addLog("success", `Cycle #${this.stats.currentCycle} completed successfully`);
+      } else {
+        this.setStatus("running", `Buy leg completed; sell leg scheduled after interval`);
+      }
     } catch (error) {
       if (!this.shouldContinueExecution()) {
         this.addLog("info", "Current execution halted before another transaction was submitted");
@@ -272,9 +349,17 @@ export class AutomationEngine {
         retryable: normalized.retryable,
       });
       if (!normalized.retryable) {
+        const failedLeg = this.pendingSellAmountRaw ? "sell" : "buy";
+        const haltMessage =
+          `Automation stopped at cycle #${this.stats.currentCycle} during the ${failedLeg} leg: ${normalized.message}`;
         this.status = "error";
-        this.statusMessage = normalized.message;
-        this.addLog("error", "Automation stopped because user action is required");
+        this.statusMessage = haltMessage;
+        this.addLog("error", haltMessage, {
+          cycle: this.stats.currentCycle,
+          leg: failedLeg,
+          code: normalized.code,
+          suggestedAction: normalized.suggestedAction,
+        });
       } else {
         retryDelayMs = Math.min(60_000, 5_000 * (2 ** Math.min(this.consecutiveFailures - 1, 4)));
         const retrySeconds = Math.ceil(retryDelayMs / 1_000);
@@ -287,6 +372,19 @@ export class AutomationEngine {
       if (this.canSchedule()) this.scheduleNext(retryDelayMs);
       this.emit();
     }
+  }
+
+  private async paperLeg(gasUsd: number): Promise<boolean> {
+    if (!this.pendingSellAmountRaw) {
+      await this.paperSwap("buy", gasUsd);
+      this.pendingSellAmountRaw = "paper";
+      await this.persist();
+      return false;
+    }
+    await this.paperSwap("sell", gasUsd);
+    this.pendingSellAmountRaw = null;
+    await this.persist();
+    return true;
   }
 
   private async paperSwap(side: "buy" | "sell", gasUsd: number): Promise<void> {
@@ -304,7 +402,7 @@ export class AutomationEngine {
     this.addLog("success", `${side === "buy" ? "Buy" : "Sell"} confirmed (paper)`);
   }
 
-  private async liveCycle(): Promise<void> {
+  private async liveLeg(): Promise<boolean> {
     if (!this.trader || !this.walletPrivateKey || !this.settings.walletAddress) {
       throw new AppError("WALLET_DISCONNECTED", "Wallet credentials are incomplete.", 409);
     }
@@ -312,7 +410,7 @@ export class AutomationEngine {
     if (!this.pendingSellAmountRaw) {
       const tradeAmountRaw = this.trader.parseEthAmount(this.settings.tradeAmountEth);
       const before = await this.trader.getBalances(this.settings.walletAddress);
-      if (!this.shouldContinueExecution()) return;
+      if (!this.shouldContinueExecution()) return false;
       if (before.ethRaw <= tradeAmountRaw) {
         throw new AppError("INSUFFICIENT_ETH", `Wallet balance ${before.eth} ETH is below the configured trade size ${this.settings.tradeAmountEth} ETH.`, 409);
       }
@@ -330,7 +428,7 @@ export class AutomationEngine {
         minimumBalanceUsd: this.settings.minimumBalanceUsd,
         shouldContinue: () => this.shouldContinueExecution(),
       });
-      if (!this.shouldContinueExecution()) return;
+      if (!this.shouldContinueExecution()) return false;
       this.recordSwapMetrics(buy.gasUsd);
 
       if (BigInt(buy.receivedRaw) <= 0n) {
@@ -346,14 +444,15 @@ export class AutomationEngine {
         receivedRaw: buy.receivedRaw,
       });
       await this.refreshBalancesBestEffort();
-      if (!this.shouldContinueExecution()) return;
+      if (!this.shouldContinueExecution()) return false;
+      return false;
     } else {
       this.addLog("warning", `Resuming pending sell for ${this.pendingSellAmountRaw} ZIG base units; no new buy will run`);
     }
 
     const sellAmountRaw = this.pendingSellAmountRaw;
     if (!sellAmountRaw) throw new AppError("INTERNAL_ERROR", "Pending sell amount was lost.");
-    if (!this.shouldContinueExecution()) return;
+    if (!this.shouldContinueExecution()) return false;
     this.setStatus("waiting_for_confirmation", "Selling ZIG...");
     this.addLog("info", `Submitting sell leg for ${sellAmountRaw} ZIG base units`);
     const sell = await this.trader.executeSwap({
@@ -376,6 +475,7 @@ export class AutomationEngine {
       receivedRaw: sell.receivedRaw,
     });
     await this.refreshBalancesBestEffort();
+    return true;
   }
 
   private scheduleNext(delayOverrideMs?: number): void {

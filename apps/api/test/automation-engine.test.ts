@@ -88,6 +88,9 @@ describe("AutomationEngine", () => {
     await engine.configureWallet({ walletAddress: address, privateKey: "1".repeat(64) });
     await engine.start();
     await vi.advanceTimersByTimeAsync(0);
+    expect(executeSwap.mock.calls.map(([input]) => input.side)).toEqual(["buy"]);
+
+    await vi.advanceTimersByTimeAsync(30_000);
     expect(executeSwap.mock.calls.map(([input]) => input.side)).toEqual(["buy", "sell"]);
 
     await vi.advanceTimersByTimeAsync(5_000);
@@ -115,6 +118,22 @@ describe("AutomationEngine", () => {
     vi.useRealTimers();
   });
 
+  it("reports the cycle and leg when a non-retryable failure stops automation", async () => {
+    vi.useFakeTimers();
+    const executeSwap = vi.fn().mockRejectedValue(new AppError("SWAP_REVERTED", "Router reverted.", 409));
+    const engine = createLiveEngine(executeSwap);
+    await engine.configureWallet({ walletAddress: address, privateKey: "1".repeat(64) });
+    await engine.start();
+    await vi.advanceTimersByTimeAsync(0);
+
+    const snapshot = engine.snapshot();
+    expect(snapshot.status).toBe("error");
+    expect(snapshot.statusMessage).toContain("Automation stopped at cycle #1 during the buy leg");
+    expect(snapshot.logs[0]?.message).toContain("Automation stopped at cycle #1 during the buy leg");
+    engine.dispose();
+    vi.useRealTimers();
+  });
+
   it("stays stopped when the start balance preflight fails", async () => {
     const getBalances = vi.fn()
       .mockResolvedValueOnce({
@@ -130,6 +149,73 @@ describe("AutomationEngine", () => {
     await engine.configureWallet({ walletAddress: address, privateKey: "1".repeat(64) });
     await expect(engine.start()).rejects.toMatchObject({ code: "RPC_UNAVAILABLE" });
     expect(engine.snapshot().status).toBe("stopped");
+    engine.dispose();
+  });
+
+  it("does not keep wallet credentials when balance refresh fails during setup", async () => {
+    const getBalances = vi.fn().mockRejectedValue(new AppError("RPC_UNAVAILABLE"));
+    const engine = createLiveEngine(vi.fn(), getBalances);
+
+    await expect(
+      engine.configureWallet({ walletAddress: address, privateKey: "1".repeat(64) }),
+    ).rejects.toMatchObject({ code: "RPC_UNAVAILABLE" });
+
+    expect(engine.snapshot()).toMatchObject({
+      signerConfigured: false,
+      settings: { walletAddress: null },
+    });
+    engine.dispose();
+  });
+
+  it("does not keep wallet credentials when persistence fails during setup", async () => {
+    const stateStore = {
+      load: vi.fn().mockResolvedValue(null),
+      save: vi.fn().mockRejectedValue(new Error("database unavailable")),
+    } as unknown as RuntimeStateStore;
+    const engine = createLiveEngine(vi.fn(), undefined, stateStore);
+
+    await expect(
+      engine.configureWallet({ walletAddress: address, privateKey: "1".repeat(64) }),
+    ).rejects.toThrow("database unavailable");
+
+    expect(engine.snapshot()).toMatchObject({
+      signerConfigured: false,
+      settings: { walletAddress: null },
+    });
+    engine.dispose();
+  });
+
+  it("rolls back settings when persistence fails", async () => {
+    const stateStore = {
+      load: vi.fn().mockResolvedValue(null),
+      save: vi.fn().mockRejectedValue(new Error("database unavailable")),
+    } as unknown as RuntimeStateStore;
+    const engine = new AutomationEngine(
+      { estimate: vi.fn().mockResolvedValue({ feeUsd: 0.5 }) },
+      { healthCheck: vi.fn().mockResolvedValue(rpcHealth), snapshot: () => rpcHealth },
+      "paper",
+      undefined,
+      stateStore,
+    );
+
+    await expect(engine.updateSettings({ tradeAmountEth: "0.05" })).rejects.toThrow("database unavailable");
+    expect(engine.snapshot().settings.tradeAmountEth).toBe("0.001");
+    engine.dispose();
+  });
+
+  it("stays stopped when persistence fails during start", async () => {
+    const stateStore = {
+      load: vi.fn().mockResolvedValue(null),
+      save: vi.fn()
+        .mockResolvedValueOnce(undefined)
+        .mockRejectedValueOnce(new Error("database unavailable")),
+    } as unknown as RuntimeStateStore;
+    const engine = createLiveEngine(vi.fn(), undefined, stateStore);
+    await engine.configureWallet({ walletAddress: address, privateKey: "1".repeat(64) });
+
+    await expect(engine.start()).rejects.toThrow("database unavailable");
+    expect(engine.snapshot().status).toBe("stopped");
+    expect(engine.snapshot().statistics.nextExecutionAt).toBeNull();
     engine.dispose();
   });
 

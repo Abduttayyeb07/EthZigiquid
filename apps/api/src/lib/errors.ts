@@ -11,6 +11,8 @@ export type ErrorCode =
   | "PRICE_IMPACT_HIGH"
   | "LIQUIDITY_UNAVAILABLE"
   | "SIMULATION_INCOMPLETE"
+  | "SESSION_INVALID"
+  | "CAPACITY_EXCEEDED"
   | "INVALID_REQUEST"
   | "INTERNAL_ERROR";
 
@@ -74,6 +76,16 @@ const guidance: Record<ErrorCode, { message: string; action: string; retryable: 
     message: "The aggregator could not fully simulate the proposed transaction.",
     action: "Do not submit until balance, allowance, and an independent eth_call simulation succeed.",
     retryable: false,
+  },
+  SESSION_INVALID: {
+    message: "The operator session is missing, expired, or was not issued by this server.",
+    action: "Request a new session from the access endpoint; the dashboard does this automatically.",
+    retryable: false,
+  },
+  CAPACITY_EXCEEDED: {
+    message: "The service is already tracking the maximum number of concurrent operator sessions.",
+    action: "Stop an idle automation session, or wait for one to be reclaimed.",
+    retryable: true,
   },
   INVALID_REQUEST: {
     message: "The request contains invalid or unsafe values.",

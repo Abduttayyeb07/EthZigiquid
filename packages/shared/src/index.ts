@@ -90,7 +90,7 @@ export const DEFAULT_SETTINGS: AutomationSettings = {
   slippageBps: 100,
   maxPriceImpactBps: 300,
   tradeAmountEth: "0.001",
-  minimumBalanceUsd: 10,
+  minimumBalanceUsd: 1,
   maxConsecutiveFailures: 3,
   walletAddress: null,
 };
